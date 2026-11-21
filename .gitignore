@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 训练产物
+*.pth
+*.onnx
+*.onnx.data
+results/
+
+# 数据
+data/
+
+# 可视化/临时
+*.png
+*.jpg
+*.jpeg
+*.json
+*.log
+
+# 系统/编辑器
+.DS_Store
+.idea/
+.vscode/
