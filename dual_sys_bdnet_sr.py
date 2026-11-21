@@ -1,55 +1,65 @@
 #!/usr/bin/env python3
 # coding: utf-8
 """
-DualSys-BDNet-SR: 单文件端到端轻量化超分流水线（BDNet 内核 + 人脑双系统选择性修正）。
+DualSys-BDNet-SR
+Author: ZRAM
 
-一条命令打通：读取数据 -> 训练 -> 有/无参考指标 -> 效率/能耗 profiling
--> 可视化（含 S2 注意力 mask）-> ONNX 导出。推理端纯本地 CNN，不联网、不依赖大模型。
+A single-file end-to-end lightweight super-resolution pipeline: a BDNet backbone
+with a brain-inspired dual-system selective refinement branch.
+
+One command covers: data loading -> training -> full/non-reference metrics ->
+efficiency/energy profiling -> visualization (with the S2 gate mask) -> ONNX export.
+The inference side is a pure local CNN; no network access and no large-model dependency.
 
 ================================================================================
-思路：比 Kahneman 双系统更贴近人脑视觉的分工
+Idea: a dual-system split closer to human visual perception
 ================================================================================
-System1（快通路 / 腹侧 feedforward，直觉重建）
-  - 即原版 BDNet-SR（zhuoran zheng）轻量化主干：深度可分离卷积 + 短残差 + 尾部单次
-    PixelShuffle，全程 LR 空间运算；无注意力、无 KV cache、算子标准，NPU/INT8 友好。
-  - 内部保留 BDNet 原生的“慢参考”机制：ChannelLowRankBDO 用 EMA 累积通道统计基准 ref，
-    以 delta = f - ref 做低秩偏差调制（训练期更新 ref，推理期冻结）——这是 BDNet 本体
-    的 System2 式先验，不丢弃。
+System 1 (fast pathway / feedforward intuition)
+  - The lightweight BDNet-SR backbone: depthwise-separable convolutions + short
+    residual + a single final PixelShuffle, all computed in LR space. No attention,
+    no KV cache; standard operators, NPU/INT8 friendly.
+  - Keeps the native BDNet "slow reference" mechanism: ChannelLowRankBDO maintains an
+    EMA channel-statistic reference `ref` and applies low-rank deviation modulation
+    with delta = f - ref (ref updated in training, frozen at inference).
 
-System2（慢通路 / 选择性再检验，审慎修正）
-  - 不是全局重算，而是模拟人脑：先由 S1 给出第一眼结果，再只对“看不清/误差大”的区域
-    做局部残差校正，平坦区域门控 mask 趋近 0，S2 几乎不产生额外算力。
-  - 输入：S1 输出 + bicubic 参考上采样；输出：修正项 delta 与空间门控 mask。
-  - 训练期用 S1 与 GT 的逐像素误差作为 mask 监督目标，使门控学会“只在难例区域开门”；
-    推理期可按 mask 全局均值自适应旁路 S2（平坦帧只跑 S1，进一步降功耗）。
+System 2 (slow pathway / selective re-inspection, cautious refinement)
+  - Instead of recomputing globally, it mimics human vision: S1 gives the first-pass
+    result, and only high-error / textured regions are locally corrected. On flat
+    regions the gate mask approaches 0, so S2 adds almost no compute.
+  - Input: S1 output + bicubic upsampled reference; Output: residual `delta` and a
+    spatial gate `mask`.
+  - During training, the per-pixel S1-vs-GT error supervises the gate so it learns to
+    "open only on hard regions"; at inference S2 can be bypassed adaptively from the
+    global mask mean (flat frames run S1 only, lower energy).
 
-工程取向（嵌入式 / RK3588 友好）
-  - 全程 LR 空间运算，末尾单次 PixelShuffle；深度可分离卷积 + ReLU6。
-  - 标准 Conv2d / PixelShuffle / ReLU6 / Sigmoid，无 permute 缓冲、无自定义算子。
-  - S1 可独立剥离导出 ONNX，S2 为可选附加分支。
+Engineering orientation (embedded / RK3588 friendly)
+  - All ops in LR space, a single final PixelShuffle; depthwise-separable conv + ReLU6.
+  - Standard Conv2d / PixelShuffle / ReLU6 / Sigmoid; no permute buffer, no custom op.
+  - S1 can be exported standalone; S2 is an optional add-on branch.
 
-评估指标
-  有参考：PSNR-Y, SSIM-Y（BT.601，裁边界）。
-  无参考：Laplacian 方差、梯度能量、NIQE、BRISQUE、PIQE（piq 缺失自动跳过）。
-  效率  ：参数量、MACs、激活 DRAM 流量、启发式能耗、逐图延迟、(有 NVML) 实测功耗/能量。
+Metrics
+  Reference   : PSNR-Y, SSIM-Y (BT.601, border cropped).
+  Non-ref.    : Laplacian variance, gradient energy, NIQE/BRISQUE/PIQE (skipped if piq missing).
+  Efficiency  : params, MACs, activation DRAM traffic, heuristic energy, per-image
+                latency, measured power/energy when NVML is available.
 
-用法：
-  # 训练（默认 x4，S1=BDNet + S2 稀疏修正）
+Usage:
+  # Train (default x4, S1=BDNet + S2 sparse refinement)
   python dual_sys_bdnet_sr.py --mode train --scale 4 --dim 10 --blocks 1
 
-  # 只训练纯 BDNet（关闭 S2，作为基线）
+  # Train pure BDNet (disable S2) as baseline
   python dual_sys_bdnet_sr.py --mode train --scale 4 --no-s2
 
-  # 评估 checkpoint（完整双系统）
+  # Evaluate checkpoint (full dual system)
   python dual_sys_bdnet_sr.py --mode eval --scale 4 --ckpt results/best.pth
 
-  # 评估纯 S1（BDNet 本体，跳过 S2 分支）
+  # Evaluate S1 only (BDNet backbone, skip S2)
   python dual_sys_bdnet_sr.py --mode eval --scale 4 --ckpt results/best.pth --only-s1
 
-  # 只看参数量 / MACs / 流量 / 延迟 / 能耗
+  # Profile params / MACs / traffic / latency / energy
   python dual_sys_bdnet_sr.py --mode profile --scale 4
 
-  # 导出 ONNX（完整双系统）；加 --only-s1 导出纯 BDNet
+  # Export ONNX (full dual system); use --only-s1 for pure BDNet
   python dual_sys_bdnet_sr.py --mode export --scale 4 --ckpt results/best.pth
 """
 
@@ -72,7 +82,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision.transforms import ToPILImage, ToTensor
 from PIL import Image
 
-# 可选依赖（缺失时自动降级，不阻断主流程）
+# Optional deps (graceful degradation if missing)
 try:
     import piq  # type: ignore
     _HAS_PIQ = True
@@ -88,19 +98,19 @@ except Exception:
 import cv2  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# 常量
+# Constants
 # ---------------------------------------------------------------------------
 EXTS = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif")
 DIV2K_TRAIN_URL = "https://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_train_HR.zip"
 DIV2K_VALID_URL = "https://data.vision.ee.ethz.ch/cvl/DIV2K/DIV2K_valid_HR.zip"
-# BT.601 SR 均值（RGB, [0,1]），轻量 SR 仓库通用。
+# BT.601 SR mean (RGB, [0,1]), common in lightweight SR repos.
 RGB_MEAN = (0.4488, 0.4371, 0.4040)
-# 启发式：每 32-bit 访问能耗（pJ），仅用于相对流量比较，非芯片级实测。
+# Heuristic energy per 32-bit access (pJ); relative traffic comparison only, not chip-level measurement.
 PJ_PER_32B_ACCESS = 4.5
 
 
 # ---------------------------------------------------------------------------
-# 基础工具
+# Utilities
 # ---------------------------------------------------------------------------
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -147,7 +157,7 @@ def _find_image_dir(root: str) -> str:
 
 
 def ensure_div2k(data_dir: str):
-    """下载 + 解压 DIV2K train/valid；返回 (train_dir, valid_dir)。已有数据则跳过。"""
+    """Download + extract DIV2K train/valid; return (train_dir, valid_dir). Skip if present."""
     div_dir = os.path.join(data_dir, "DIV2K")
     train_dir = os.path.join(div_dir, "train")
     valid_dir = os.path.join(div_dir, "valid")
@@ -167,10 +177,10 @@ def ensure_div2k(data_dir: str):
 
 
 # ---------------------------------------------------------------------------
-# 数据集：on-the-fly bicubic 生成 LR/HR 对
+# Dataset: on-the-fly bicubic LR/HR pairs
 # ---------------------------------------------------------------------------
 class SRDataset(Dataset):
-    """由 HR 图实时 bicubic 下采样得到 LR。"""
+    """Generate LR on the fly by bicubic downsampling HR."""
 
     def __init__(self, root: str, scale: int, patch_size: int, train: bool,
                  recursive: bool = True):
@@ -215,10 +225,10 @@ class SRDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# 指标
+# Metrics
 # ---------------------------------------------------------------------------
 def rgb_to_y(x: torch.Tensor) -> torch.Tensor:
-    """BT.601 亮度，[0,1]；x: CxHxW。"""
+    """BT.601 luma, [0,1]; x: CxHxW."""
     r, g, b = x[0], x[1], x[2]
     y = 16.0 / 255.0 + (65.481 * r + 12.255 * g + 24.966 * b) / 255.0
     return y.clamp(0.0, 1.0)
@@ -250,7 +260,7 @@ def ssim_y(sr: torch.Tensor, hr: torch.Tensor, scale: int) -> float:
 
 
 def nr_metrics(sr: torch.Tensor) -> Dict[str, float]:
-    """无参考指标：拉普拉斯方差、梯度能量；piq 可用时补 NIQE/BRISQUE/PIQE。"""
+    """Non-reference: Laplacian variance, gradient energy; NIQE/BRISQUE/PIQE if piq available."""
     y = (rgb_to_y(sr).numpy() * 255.0).astype(np.uint8)
     lap = float(cv2.Laplacian(y, cv2.CV_64F).var())
     gx = cv2.Sobel(y, cv2.CV_64F, 1, 0)
@@ -276,14 +286,14 @@ def nr_metrics(sr: torch.Tensor) -> Dict[str, float]:
 
 
 # ---------------------------------------------------------------------------
-# System1：超轻量 BDNet-SR 主干（千参数量级，保留 BDO / EMA 慢参考）
+# System 1: ultra-light BDNet-SR backbone (~1k params, keeps BDO/EMA slow reference)
 # ---------------------------------------------------------------------------
 class ChannelLowRankBDO(nn.Module):
-    """低秩基准形变通道调制（BDNet Eq.1-3），固定低秩 rank=1 以压参数量。
+    """Low-rank baseline deformation channel modulation (BDNet Eq.1-3), fixed rank=1 to save params.
 
     delta = f - s ; corr = gamma * (V(W delta)) ; W: D->1, V: 1->D。
-    1x1 卷积，保持 NCHW，无 permute 缓冲；参考 s 为 detached EMA buffer，
-    仅训练期更新，推理期冻结。
+    1x1 conv, keeps NCHW, no permute buffer; reference s is a detached EMA buffer,
+    updated in training only, frozen at inference.
     """
 
     def __init__(self, dim: int, alpha: float):
@@ -306,7 +316,7 @@ class ChannelLowRankBDO(nn.Module):
 
 
 class MicroBlock(nn.Module):
-    """超轻量残差单元：深度可分离 3x3 空间混合 + 1x1 通道混合，单条短残差。"""
+    """Ultra-light residual unit: depthwise-separable 3x3 spatial mix + 1x1 channel mix, single short residual."""
 
     def __init__(self, dim: int):
         super().__init__()
@@ -319,12 +329,12 @@ class MicroBlock(nn.Module):
 
 
 class MicroBDNetSR(nn.Module):
-    """System1（快通路）：千参数量级 BDNet-SR 主干，可独立推理、单独导出 ONNX。
+    """System 1 (fast pathway): ~1k-param BDNet-SR backbone, standalone inference / ONNX export.
 
-    压参关键：
-      - 窄通道、单/少残差单元；
-      - 上采样用 1x1 卷积直接预测 3*r² 子像素通道（去掉 3x3 上采样大卷积）；
-      - 无独立 tail/out 3x3 卷积，子像素层直接输出 RGB 残差。
+    Key params savings:
+      - narrow channels, one/few residual units;
+      - 1x1 conv predicts 3*r² sub-pixel channels directly (no big 3x3 upsampling conv);
+      - no separate tail/out 3x3 conv; sub-pixel layer outputs RGB residual directly.
     """
 
     def __init__(self, scale: int, dim: int = 10, blocks: int = 1,
@@ -337,7 +347,7 @@ class MicroBDNetSR(nn.Module):
         self.body = nn.ModuleList([MicroBlock(dim) for _ in range(blocks)])
         if use_bdo:
             self.bdo = ChannelLowRankBDO(dim, alpha)
-        # 1x1 子像素预测：dim -> 3*r²，PixelShuffle 上采样
+        # 1x1 sub-pixel prediction: dim -> 3*r², PixelShuffle upsample
         self.subpixel = nn.Conv2d(dim, in_chans * scale * scale, kernel_size=1, bias=False)
         self.shuffle = nn.PixelShuffle(scale)
         self._init_weights()
@@ -357,19 +367,19 @@ class MicroBDNetSR(nn.Module):
             if self.training:
                 self.bdo.update_reference(h)
             h = h + self.bdo(h)
-        h = shortcut + h                       # 单一全局 LR 残差
-        out = self.shuffle(self.subpixel(h))    # 末尾单次子像素上采样
+        h = shortcut + h                       # single global LR residual
+        out = self.shuffle(self.subpixel(h))    # single final sub-pixel upsample
         return out + self.mean
 
 
 # ---------------------------------------------------------------------------
-# System2：超轻量稀疏门控审慎修正分支（选择性再检验）
+# System 2: ultra-light sparse-gated cautious refinement branch (selective re-inspection)
 # ---------------------------------------------------------------------------
 class System2Refine(nn.Module):
-    """慢思考分支：1x1 卷积预测修正项 delta 与空间门控 mask。
+    """Slow pathway: 1x1 conv predicts residual delta and spatial gate mask.
 
-    mask ∈ (0,1)，平坦区域趋近 0（不修正、不耗算力），纹理/边缘/误差区域趋近 1。
-    全程 1x1 卷积，参数量极小；无注意力、无循环。
+    mask in (0,1): ~0 on flat regions (no correction, no compute), ~1 on texture/edge/error regions.
+    All 1x1 conv, very few params; no attention, no recurrence.
     """
 
     def __init__(self, dim: int = 4, in_chans: int = 3):
@@ -389,11 +399,11 @@ class System2Refine(nn.Module):
 
 
 class DualSysBDNetSR(nn.Module):
-    """双系统融合：S1 = 超轻量 BDNet-SR 快通路；S2 = 稀疏门控选择性修正。
+    """Dual-system fusion: S1 = ultra-light BDNet-SR fast pathway; S2 = sparse-gated selective refinement.
 
-    forward 返回 (final_hr, s1_hr, mask)：
-      - final_hr = s1_hr + delta * mask（开启 S2 时）；
-      - 关闭 S2 时 final_hr = s1_hr，mask 返回全零占位。
+    forward returns (final_hr, s1_hr, mask):
+      - final_hr = s1_hr + delta * mask (S2 enabled);
+      - with S2 disabled, final_hr = s1_hr and mask is a zero placeholder.
     """
 
     def __init__(self, scale: int, dim: int = 10, blocks: int = 1,
@@ -422,7 +432,7 @@ class DualSysBDNetSR(nn.Module):
         delta, mask = self.s2(s1_hr, bicubic)
         refine = delta * mask
 
-        # 推理期自适应旁路：mask 全局均值低于阈值时，跳过 S2 修正（纯 S1 输出）。
+        # Adaptive inference bypass: skip S2 when global mask mean is below threshold (pure S1 output).
         if (not self.training) and self.s2_bypass_threshold > 0.0:
             mask_mean = mask.mean().item()
             if mask_mean < self.s2_bypass_threshold:
@@ -433,7 +443,7 @@ class DualSysBDNetSR(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 效率 profiling：参数量 / MACs / 激活流量 / 延迟 / 能耗
+# Efficiency profiling: params / MACs / activation traffic / latency / energy
 # ---------------------------------------------------------------------------
 def profile_model(model: nn.Module, lr: torch.Tensor) -> Dict:
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -457,7 +467,7 @@ def profile_model(model: nn.Module, lr: torch.Tensor) -> Dict:
     for h in hooks:
         h.remove()
 
-    bytes_elem = 4  # FP32；AMP 下减半为 2
+    bytes_elem = 4  # FP32; halves to 2 under AMP
     total_bytes = (traffic["in_elems"] + traffic["out_elems"]) * bytes_elem
     traffic_joule = total_bytes * PJ_PER_32B_ACCESS * 1e-12
     return {
@@ -521,12 +531,12 @@ def benchmark_latency(model: nn.Module, lr: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
-# 评估
+# Evaluation
 # ---------------------------------------------------------------------------
 @torch.no_grad()
 def _forward(model: nn.Module, lr: torch.Tensor, only_s1: bool
              ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """返回 (sr, s1, mask)；兼容双系统模型与纯 S1 模型。"""
+    """Return (sr, s1, mask); compatible with dual-system and S1-only models."""
     out = model(lr)
     if isinstance(out, tuple):
         final, s1, mask = out
@@ -602,14 +612,14 @@ def build_eval_loaders(args, valid_dir: str) -> Dict[str, DataLoader]:
 
 
 # ---------------------------------------------------------------------------
-# 可视化
+# Visualization
 # ---------------------------------------------------------------------------
 def _to_pil(t: torch.Tensor) -> Image.Image:
     return ToPILImage()(t.clamp(0, 1).cpu())
 
 
 def _mask_to_pil(mask: torch.Tensor) -> Image.Image:
-    """mask: CxHxW -> 灰度 PIL（均值通道）。"""
+    """mask: CxHxW -> grayscale PIL (channel mean)."""
     m = mask.mean(dim=0, keepdim=True).clamp(0, 1).cpu()
     return ToPILImage()(m)
 
@@ -617,7 +627,7 @@ def _mask_to_pil(mask: torch.Tensor) -> Image.Image:
 def save_compare_grid(model: nn.Module, loader: DataLoader, scale: int,
                       device: torch.device, out_path: str, n: int = 4,
                       show_mask: bool = True) -> None:
-    """保存 LR / Bicubic / SR(Ours) / S1(BDNet) / HR / S2-mask 对比网格。"""
+    """Save LR / Bicubic / SR(Ours) / S1(BDNet) / HR / S2-mask comparison grid."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -707,7 +717,7 @@ def plot_training_curves(history: List[Dict], out_dir: str) -> None:
         fig.savefig(os.path.join(out_dir, "nr_curves.png"), dpi=130, bbox_inches="tight")
         plt.close(fig)
 
-    # S2 mask 活跃度曲线
+    # S2 gate-mask activity curve
     mask_curve = [h["s2_mask_mean"] for h in history if "s2_mask_mean" in h]
     if mask_curve:
         fig, ax = plt.subplots(figsize=(6, 4))
@@ -720,7 +730,7 @@ def plot_training_curves(history: List[Dict], out_dir: str) -> None:
 
 
 def plot_metric_bar(results: Dict[str, Dict], out_dir: str) -> None:
-    """各 benchmark 指标柱状图。"""
+    """Bar chart of per-benchmark metrics."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -746,10 +756,10 @@ def plot_metric_bar(results: Dict[str, Dict], out_dir: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 损失：重建 + S1 独立监督 + mask 误差对齐 + 稀疏正则
+# Loss: reconstruction + S1 standalone supervision + mask error alignment + sparsity
 # ---------------------------------------------------------------------------
 def mask_target_from_error(s1: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
-    """逐图把 |s1-gt| 归一化到 [0,1]，作为 S2 门控的监督目标（detach）。"""
+    """Per-image normalize |s1-gt| to [0,1] as the S2 gate supervision target (detached)."""
     err = (s1 - gt).abs().mean(dim=1, keepdim=True)  # Bx1xHxW
     b = err.size(0)
     tgt = torch.zeros_like(err)
@@ -790,7 +800,7 @@ def compute_loss(model: nn.Module, sr: torch.Tensor, s1: torch.Tensor,
 
 
 # ---------------------------------------------------------------------------
-# 训练
+# Training
 # ---------------------------------------------------------------------------
 def train(args) -> None:
     set_seed(args.seed)
@@ -897,13 +907,13 @@ def train(args) -> None:
         torch.save({"model_state": model.state_dict(),
                     "args": vars(args), "epoch": epoch}, ckpt_last)
 
-    # 最终 profiling + 延迟/能耗
+    # Final profiling + latency/energy
     sample_lr = torch.randn(1, 3, args.patch_size // args.scale,
                             args.patch_size // args.scale, device=device)
     profile = profile_model(model, sample_lr)
     energy = benchmark_latency(model, sample_lr, n=args.energy_runs)
 
-    # 可视化
+    # Visualization
     plot_training_curves(history, args.out_dir)
     final_eval: Dict[str, Dict] = {}
     for name, loader in eval_loaders.items():
@@ -928,7 +938,7 @@ def train(args) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 评估 / profiling / 导出
+# Evaluation / profiling / export
 # ---------------------------------------------------------------------------
 def _build_model(args, device) -> DualSysBDNetSR:
     return DualSysBDNetSR(
@@ -988,7 +998,7 @@ def profile_only(args) -> None:
 
 
 def export_onnx(args) -> None:
-    device = torch.device("cpu")  # ONNX 导出用 CPU 更稳妥
+    device = torch.device("cpu")  # CPU is safer for ONNX export
     model = _build_model(args, device)
     if args.ckpt and os.path.exists(args.ckpt):
         ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
@@ -999,7 +1009,7 @@ def export_onnx(args) -> None:
     os.makedirs(args.out_dir, exist_ok=True)
 
     if args.only_s1:
-        # 纯 BDNet(S1) 导出：单输入单输出，算子最精简，适合 INT8 量化部署
+        # Pure BDNet(S1) export: single in/out, minimal ops, INT8 quantization friendly
         onnx_path = os.path.join(args.out_dir, "bdnet_s1.onnx")
         torch.onnx.export(
             model.s1, x, onnx_path, opset_version=18,
@@ -1011,7 +1021,7 @@ def export_onnx(args) -> None:
         onnx_path = os.path.join(args.out_dir, "dual_sys_bdnet_sr.onnx")
 
         class _Wrapper(nn.Module):
-            """导出时只保留主输出 HR，丢弃 mask 占位，方便 RKNN 解析。"""
+            """Keep only the main HR output at export; drop the mask placeholder for easier RKNN parsing."""
 
             def __init__(self, m: DualSysBDNetSR):
                 super().__init__()
@@ -1031,37 +1041,37 @@ def export_onnx(args) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 参数
+# Arguments
 # ---------------------------------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(description="DualSys-BDNet-SR embedded-friendly SR pipeline")
     p.add_argument("--mode", choices=["train", "eval", "profile", "export"], default="train")
     p.add_argument("--scale", type=int, default=4, choices=[2, 3, 4])
 
-    # 数据
+    # Data
     p.add_argument("--data-dir", default="./data")
-    p.add_argument("--train-dir", default="", help="显式指定 HR 训练集目录（覆盖 DIV2K 自动下载）")
+    p.add_argument("--train-dir", default="", help="explicit HR training dir (overrides DIV2K auto-download)")
     p.add_argument("--patch-size", type=int, default=48)
     p.add_argument("--workers", type=int, default=4)
 
-    # 模型（S1 / 超轻量 BDNet）
-    p.add_argument("--dim", type=int, default=10, help="主干通道数（千参量级：8≈800，10≈1000）")
-    p.add_argument("--blocks", type=int, default=1, help="残差单元数（默认 1，压参数量）")
+    # Model (S1 / ultra-light BDNet)
+    p.add_argument("--dim", type=int, default=10, help="backbone channels (8 ~800 params, 10 ~1000 params)")
+    p.add_argument("--blocks", type=int, default=1, help="number of residual units (default 1, keeps params low)")
     p.add_argument("--alpha", type=float, default=0.95, help="slow reference EMA momentum")
-    p.add_argument("--no-bdo", action="store_true", help="关闭 BDO 低秩慢参考调制")
+    p.add_argument("--no-bdo", action="store_true", help="disable BDO low-rank slow-reference modulation")
 
-    # 模型（S2 / 稀疏门控修正）
-    p.add_argument("--no-s2", action="store_true", help="关闭 S2 分支，退化为纯 BDNet-SR 基线")
-    p.add_argument("--s2-dim", type=int, default=4, help="S2 分支隐藏通道数")
-    p.add_argument("--s1-weight", type=float, default=0.4, help="S1 独立监督 loss 权重")
+    # Model (S2 / sparse-gated refinement)
+    p.add_argument("--no-s2", action="store_true", help="disable S2 branch, fall back to pure BDNet-SR baseline")
+    p.add_argument("--s2-dim", type=int, default=4, help="S2 branch hidden channels")
+    p.add_argument("--s1-weight", type=float, default=0.4, help="weight of S1 standalone supervision loss")
     p.add_argument("--mask-target-weight", type=float, default=0.2,
-                   help="mask 与 S1 误差对齐 loss 权重")
+                   help="weight of mask-to-S1-error alignment loss")
     p.add_argument("--sparse-weight", type=float, default=1e-3,
-                   help="mask 稀疏正则权重（鼓励平坦区域关门）")
+                   help="mask sparsity weight (encourage closed gate on flat regions)")
     p.add_argument("--s2-bypass-threshold", type=float, default=0.0,
-                   help="推理期 mask 全局均值低于该值时旁路 S2；0 表示不旁路")
+                   help="bypass S2 at inference when global mask mean below this; 0 = no bypass")
 
-    # 训练
+    # Training
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1.5e-3)
@@ -1070,13 +1080,13 @@ def parse_args():
     p.add_argument("--eval-every", type=int, default=10)
     p.add_argument("--seed", type=int, default=42)
 
-    # IO / 评测
+    # IO / Evaluation
     p.add_argument("--ckpt", default="./results/best.pth")
     p.add_argument("--out-dir", default="./results")
     p.add_argument("--max-eval", type=int, default=None)
     p.add_argument("--energy-runs", type=int, default=50)
     p.add_argument("--only-s1", action="store_true",
-                   help="评估/导出时只使用 S1（BDNet 本体），跳过 S2")
+                   help="use S1 only (BDNet backbone) for eval/export, skip S2")
     return p.parse_args()
 
 

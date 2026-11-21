@@ -1,4 +1,4 @@
-# ---- 核心（训练 / 评估 / profiling 必需）----
+# ---- Core (training / evaluation / profiling) ----
 torch>=2.0
 torchvision>=0.15
 numpy
@@ -6,10 +6,10 @@ opencv-python
 pillow
 scikit-image
 matplotlib
-thop                       # MACs 统计
+thop                       # MACs counting
 
-# ---- 可选：无参考画质指标（缺失时自动跳过 NIQE/BRISQUE/PIQE）----
+# ---- Optional: non-reference quality metrics (NIQE/BRISQUE/PIQE skipped if absent) ----
 # piq
 
-# ---- 可选：GPU 实测功耗/能量 ----
+# ---- Optional: measured GPU power / energy ----
 # pynvml

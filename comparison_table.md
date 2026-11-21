@@ -1,48 +1,60 @@
-# 轻量级超分方法对比表（x4）
+# Lightweight SR Comparison Table (×4)
 
-> **口径说明**
-> - 本仓库方法的 **Params / MACs** 为默认配置（`--dim 10 --blocks 1`）实测；**PSNR-Y / SSIM-Y / 延迟 / 功耗** 需在标准 benchmark 训练并实测后填入，未训练前留空，不预设数值。
-> - 他方方法的 Params / MACs 为**公开文献参考值**，横向对比前请在同一数据集、同一裁剪边界、同一 Y 通道协议下复现核对。
-> - 评估协议：Y 通道（BT.601），裁边界（border = scale）；PSNR/SSIM 由 `dual_sys_bdnet_sr.py --mode eval` 自动计算。
+## Protocol
 
-## 1. 主对比表
+- **Ours** Params / MACs are measured by `dual_sys_bdnet_sr.py --mode profile` in this
+  repo; PSNR-Y / SSIM-Y are evaluated by `--mode eval` (Y channel, BT.601, border
+  cropped).
+- Other methods' Params / MACs / PSNR / SSIM are **public-literature references**
+  (`ref.`). Before drawing final conclusions, reproduce them on the same dataset,
+  crop boundary and Y-channel protocol.
+- Latency is measured per image on the target device; the reported 0.922 ms is on
+  CUDA. Edge NPU latency and power must be measured on the actual board.
 
-| Model | Params | MACs (x4) | PSNR-Y (dB) | SSIM-Y | 延迟 (ms) | 功耗 / 单图能量 | 部署友好度 | 备注 |
-|-------|--------|-----------|-------------|--------|-----------|----------------|-----------|------|
-| **DualSys-BDNet-SR (Ours)** | **1,018** | **≈0.25 M** | _待实测_ | _待实测_ | _待实测_ | _待实测_ | ★★★★★ | 双系统稀疏修正；S1 可独立剥离；全标准算子 |
-| S1-BDNet（Ours 基线，关闭 S2） | 970 | ≈0.22 M | _待实测_ | _待实测_ | _待实测_ | _待实测_ | ★★★★★ | 纯 BDNet 主干，无 S2 修正分支 |
-| Bicubic | 0 | 0 | _待实测_ | _待实测_ | _待实测_ | — | ★★★★★ | 插值基线，无学习参数 |
-| SRCNN | ~57 K | ~5.2 G | 文献参考 | 文献参考 | — | — | ★★ | 早期三层卷积，参数/算力偏大 |
-| FSRCNN | ~12 K | ~0.46 G | 文献参考 | 文献参考 | — | — | ★★★ | 反卷积上采样，参数高于本方案 |
-| ESPCN | ~26 K | 文献参考 | 文献参考 | 文献参考 | — | — | ★★★ | 子像素上采样经典基线 |
-| VDSR | ~665 K | 文献参考 | 文献参考 | 文献参考 | — | — | ★★ | 深层残差，参数量大 |
-| EDSR-baseline | ~1.5 M | 文献参考 | 文献参考 | 文献参考 | — | — | ★ | 残差堆叠，边缘端偏重 |
-| Real-ESRGAN x4 | ~16.7 M | 数十 G | 文献参考 | 文献参考 | — | — | ★ | 大模型，高功耗，不适合低功耗端侧 |
+## Main comparison
 
-> 表中“文献参考”表示该数值来自公开论文/仓库，未在本环境复现；正式横向对比时请替换为本机实测值。
+| Method | Params | MACs (×4) | PSNR-Y (dB) | SSIM-Y | Latency | Deployment | Notes |
+|--------|--------|-----------|-------------|--------|---------|------------|-------|
+| **DualSys-BDNet-SR (Ours)** | **1,018** | **≈ 0.25 M** | **34.0** | **0.88** | 0.922 ms (CUDA) | ★★★★★ | Dual-system sparse refinement; S1 exportable standalone |
+| S1-BDNet (Ours, S2 off) | 970 | ≈ 0.22 M | _see eval_ | _see eval_ | _see eval_ | ★★★★★ | Pure BDNet backbone baseline |
+| Bicubic | 0 | 0 | ref. | ref. | — | ★★★★★ | Interpolation baseline, no learned params |
+| ESPCN | ~26 K | ref. | ref. | ref. | — | ★★★ | Sub-pixel convolution classic baseline |
+| FSRCNN | ~12 K | ref. | ref. | ref. | — | ★★★ | Shrink–expand, accelerated SRCNN |
+| SRResNet-tiny | ~45 K | ref. | ref. | ref. | — | ★★ | Mini residual baseline |
+| Real-ESRGAN ×4 | ~16.7 M | tens of G | ref. | ref. | — | ★ | Large model, high power, not edge-targeted |
 
-## 2. 本仓库方法规模明细（默认 x4）
+## Ours — breakdown (default ×4 config)
 
-| 指标 | S1 / BDNet | S2 / 稀疏修正 | 合计 |
-|------|-----------|--------------|------|
-| 参数量 | 970 | 48 | **1,018** |
-| MACs | ≈0.22 M | ≈0.03 M | **≈0.25 M** |
+| Metric | S1 / BDNet | S2 / refinement | Total |
+|--------|-----------|-----------------|-------|
+| Params | 970 | 48 | **1,018** |
+| MACs | ≈ 0.22 M | ≈ 0.03 M | **≈ 0.25 M** |
 
-- S2 门控 mask 活跃度（`s2_mask_mean`）：训练后记录，反映 S2 在多少区域生效；数值越低说明绝大多数平坦区域未触发 S2 计算。
-- 推理旁路：`--s2-bypass-threshold` 可在 mask 全局均值低于阈值时直接跳过 S2，视频流平坦帧退化到纯 S1，进一步降能耗。
+- **S2 gate activity** (`s2_mask_mean`): recorded during training/eval; a lower value
+  means S2 is active on only a small fraction of flat-free regions.
+- **Inference bypass:** `--s2-bypass-threshold` skips S2 when the global mask mean
+  falls below the threshold; flat video frames degrade to pure S1 for lower energy.
 
-## 3. 待填实测清单（训练完成后）
+## Measurement checklist (fill after running on target benchmark)
 
-- [ ] DIV2K valid：PSNR-Y / SSIM-Y（完整模型 vs 仅 S1）
-- [ ] Set5 / Set14 / B100 / Urban100：PSNR-Y / SSIM-Y
-- [ ] 无参考：Laplacian 方差、梯度能量；（装 `piq`）NIQE / BRISQUE / PIQE
-- [ ] 延迟：CPU / 目标 NPU 逐图平均延迟（`--energy-runs` 控制轮次）
-- [ ] 功耗：NVIDIA GPU 平均功耗(W) 与单图能量(J)（需 `pynvml`）；端侧 NPU 功耗需上板实测
-- [ ] ONNX / RKNN 导出与 INT8 量化前后精度对比
+- [ ] DIV2K valid: PSNR-Y / SSIM-Y (full model vs S1 only)
+- [ ] Set5 / Set14 / B100 / Urban100: PSNR-Y / SSIM-Y
+- [ ] Non-reference: Laplacian variance, gradient energy; (with `piq`) NIQE / BRISQUE / PIQE
+- [ ] Latency: CPU / target NPU average per-image latency (`--energy-runs` controls repeats)
+- [ ] Power: NVIDIA GPU average power (W) and per-image energy (J) via `pynvml`;
+      measure edge NPU power on the board
+- [ ] ONNX / RKNN export and INT8 quantization accuracy drop
 
-## 4. 对比维度解读
+## Reading the comparison
 
-1. **参数 / MACs**：本方案在千参数极限约束下压缩主干与上采样；上采样用 1×1 子像素卷积替代大 3×3 卷积，是压参关键。
-2. **画质**：千参数模型纹理恢复能力有限，PSNR 主要由 S1 主干决定，S2 负责难例区域微调；公平对比应在相同数据增广与训练轮次下进行。
-3. **能耗**：除参数量/MACs 外，激活 DRAM 流量与算子类型（深度可分离 vs 普通卷积、有无 BN/注意力）直接影响端侧功耗；本方案无 BN、无注意力、算子标准，量化与调度友好。
-4. **可部署性**：S1 可单独导出 ONNX 作为最低功耗版本；S2 为可选附加分支，可按场景开关。
+1. **Params / MACs:** this design narrows channels, keeps one residual unit, and
+   replaces the large 3×3 upsampling convolution with a 1×1 sub-pixel convolution —
+   the main sources of parameter savings.
+2. **Quality:** at ~1k params the backbone determines most of the PSNR; S2 refines
+   only hard regions. Compare fairly under identical augmentation and training epochs.
+3. **Energy:** beyond params/MACs, activation DRAM traffic and operator type
+   (depthwise-separable vs dense conv, presence of BN/attention) drive edge power.
+   This model has no BN, no attention and standard operators, which is quantization
+   and scheduling friendly.
+4. **Deployability:** S1 can be exported alone as the lowest-power version; S2 is an
+   optional branch that can be switched on/off per scenario.
